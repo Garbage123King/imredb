@@ -541,104 +541,80 @@ void RedbParser::traverse_tree(uint32_t page_num, std::vector<std::pair<std::str
         // 字节 0: 类型 (1 = leaf)
         // 字节 1: god_byte
         // 字节 2-3: 条目数量
-        // 字节 4-7: 第一个键结束偏移
-        // 字节 8-11: 第一个值结束偏移
+        // 字节 4+: offset 表 (每个条目 8 字节: key_end + value_end)
+        // offset 表之后是实际数据
         
-        // 检测格式：检查第一个 key_end 偏移
-        uint32_t first_key_end = buffer[4] | (buffer[5] << 8) | 
+        // 找出有效条目数（value_end < page_size）
+        uint16_t valid_entries = 0;
+        for (uint16_t i = 0; i < entry_count; i++) {
+            uint32_t offset_base = 4 + i * 8;
+            if (offset_base + 8 > page_size_) break;
+            uint32_t ve = buffer[offset_base + 4] | (buffer[offset_base + 5] << 8) |
+                          (buffer[offset_base + 6] << 16) | (buffer[offset_base + 7] << 24);
+            if (ve >= page_size_) break;
+            valid_entries++;
+        }
+        
+        if (valid_entries == 0) {
+            delete[] buffer;
+            return;
+        }
+        
+        // 计算数据起始位置：first_key_end - 8
+        uint32_t first_key_end = buffer[4] | (buffer[5] << 8) |
                                   (buffer[6] << 16) | (buffer[7] << 24);
+        size_t data_start = first_key_end - 8;
         
-        // 如果 key_end > 400，说明是新格式，数据从 offset 416 开始
-        // 每个 entry = [key:8bytes][value:8bytes] = 16 bytes
-        if (first_key_end > 400) {
-            // 新格式: 固定 16 字节 per entry
-            size_t data_start = 416;  // 跳过 offset 表
-            for (uint16_t i = 0; i < entry_count && i < 200; i++) {
-                uint32_t key_offset = data_start + i * 16;
-                uint32_t value_offset = key_offset + 8;
+        // 数据格式：每个 16 字节块包含 [key:8][key:8]，但我们解析时需要从 offset 表获取实际范围
+        // 实际上数据是连续的 [key:8][value:8] 对
+        // offset[i].key_end 指向 key_i 结束的位置（相对于页面）
+        // offset[i].value_end 指向 value_i 结束的位置
+        
+        // 由于 offset 表是相对于页面起始的绝对偏移，我们需要计算每个 entry 的实际位置
+        // 但数据区域从 data_start 开始，每个 entry = 16 bytes [key:8][value:8]
+        
+        for (uint16_t i = 0; i < valid_entries; i++) {
+            // 每个 entry 的数据位置
+            size_t block_start = data_start + i * 16;
+            
+            // 检查第一个 key (8 bytes)
+            if (block_start + 8 <= page_size_ && 
+                buffer[block_start] == 'n' && buffer[block_start+1] == 'o' &&
+                buffer[block_start+2] == 'd' && buffer[block_start+3] == 'e' &&
+                buffer[block_start+4] == '-') {
                 
-                if (value_offset + 8 > page_size_) break;
+                std::string key(reinterpret_cast<const char*>(&buffer[block_start]), 8);
                 
-                // 检查 key 是否是有效文本
-                bool is_text = true;
+                // 解析 u64 值
+                size_t value_offset = block_start + 8;
+                uint64_t int_value = 0;
                 for (int j = 0; j < 8; j++) {
-                    uint8_t c = buffer[key_offset + j];
-                    if (c < 32 || c > 126) {
-                        is_text = false;
-                        break;
-                    }
+                    int_value |= (static_cast<uint64_t>(buffer[value_offset + j]) << (j * 8));
                 }
+                std::stringstream ss;
+                ss << int_value;
+                results.push_back({key, ss.str()});
+            }
+            
+            // 检查第二个 key (同一个 16 字节块的第二部分)
+            size_t key2_offset = block_start + 8;
+            if (key2_offset + 8 <= page_size_ &&
+                buffer[key2_offset] == 'n' && buffer[key2_offset+1] == 'o' &&
+                buffer[key2_offset+2] == 'd' && buffer[key2_offset+3] == 'e' &&
+                buffer[key2_offset+4] == '-') {
                 
-                if (is_text) {
-                    std::string key(reinterpret_cast<const char*>(&buffer[key_offset]), 8);
-                    
-                    // 解析 u64 值
+                std::string key(reinterpret_cast<const char*>(&buffer[key2_offset]), 8);
+                
+                // 第二个 key 的 value 在下一个 16 字节块的第 8-15 字节
+                size_t value2_offset = block_start + 16 + 8;
+                if (value2_offset + 8 <= page_size_) {
                     uint64_t int_value = 0;
                     for (int j = 0; j < 8; j++) {
-                        int_value |= (static_cast<uint64_t>(buffer[value_offset + j]) << (j * 8));
+                        int_value |= (static_cast<uint64_t>(buffer[value2_offset + j]) << (j * 8));
                     }
                     std::stringstream ss;
                     ss << int_value;
                     results.push_back({key, ss.str()});
-                }
-            }
-        } else {
-            // 旧格式: 使用 offset 表
-            size_t data_start = 8;
-            
-            if (entry_count >= 1) {
-                uint32_t key_end_offset = buffer[4] | (buffer[5] << 8) | 
-                                          (buffer[6] << 16) | (buffer[7] << 24);
-                uint32_t value_end_offset = buffer[8] | (buffer[9] << 8) | 
-                                            (buffer[10] << 16) | (buffer[11] << 24);
-                
-                // 第一个条目
-                uint32_t key_start = data_start;
-                uint32_t key_len = key_end_offset - key_start;
-                uint32_t value_start = key_end_offset;
-                uint32_t value_len = (value_end_offset > key_end_offset && value_end_offset < page_size_) ? 
-                                     (value_end_offset - value_start) : 8;
-                
-                if (key_len > 0 && key_len < 256 && value_len > 0 && value_len <= 16) {
-                    if (key_start + key_len <= page_size_ && value_start + value_len <= page_size_) {
-                        std::string key(reinterpret_cast<char*>(&buffer[key_start]), key_len);
-                        uint64_t int_value = 0;
-                        for (uint32_t i = 0; i < value_len; i++) {
-                            int_value |= (static_cast<uint64_t>(buffer[value_start + i]) << (i * 8));
-                        }
-                        std::stringstream ss;
-                        ss << int_value;
-                        results.push_back({key, ss.str()});
-                    }
-                }
-                
-                // 处理额外条目
-                for (uint16_t i = 1; i < entry_count; i++) {
-                    uint32_t offset_base = 4 + i * 8;
-                    if (offset_base + 8 > page_size_) break;
-                    
-                    uint32_t ke = buffer[offset_base] | (buffer[offset_base + 1] << 8) |
-                                  (buffer[offset_base + 2] << 16) | (buffer[offset_base + 3] << 24);
-                    uint32_t ve = buffer[offset_base + 4] | (buffer[offset_base + 5] << 8) |
-                                  (buffer[offset_base + 6] << 16) | (buffer[offset_base + 7] << 24);
-                    
-                    uint32_t ks = data_start;
-                    uint32_t kl = ke - ks;
-                    uint32_t vs = ke;
-                    uint32_t vl = (ve > ke && ve < page_size_) ? (ve - vs) : 8;
-                    
-                    if (kl > 0 && kl < 256 && vl > 0 && vl <= 16) {
-                        if (ks + kl <= page_size_ && vs + vl <= page_size_) {
-                            std::string key(reinterpret_cast<char*>(&buffer[ks]), kl);
-                            uint64_t int_value = 0;
-                            for (uint32_t j = 0; j < vl; j++) {
-                                int_value |= (static_cast<uint64_t>(buffer[vs + j]) << (j * 8));
-                            }
-                            std::stringstream ss;
-                            ss << int_value;
-                            results.push_back({key, ss.str()});
-                        }
-                    }
                 }
             }
         }
