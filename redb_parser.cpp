@@ -541,77 +541,103 @@ void RedbParser::traverse_tree(uint32_t page_num, std::vector<std::pair<std::str
         // 字节 0: 类型 (1 = leaf)
         // 字节 1: god_byte
         // 字节 2-3: 条目数量
-        // 字节 4-7: 第一个键结束偏移 (相对于数据起始位置)
-        // 字节 8-11: 第一个值结束偏移 (0表示使用默认值)
-        // 数据从字节 8 开始
+        // 字节 4-7: 第一个键结束偏移
+        // 字节 8-11: 第一个值结束偏移
         
-        uint32_t key_end_offset = buffer[4] | (buffer[5] << 8) | 
+        // 检测格式：检查第一个 key_end 偏移
+        uint32_t first_key_end = buffer[4] | (buffer[5] << 8) | 
                                   (buffer[6] << 16) | (buffer[7] << 24);
-        uint32_t value_end_offset = buffer[8] | (buffer[9] << 8) | 
-                                    (buffer[10] << 16) | (buffer[11] << 24);
         
-        // 数据从字节 8 开始
-        size_t data_start = 8;
-        
-        if (entry_count >= 1) {
-            // 对于第一个条目
-            uint32_t key_start = data_start;
-            uint32_t key_len = key_end_offset - key_start;
-            
-            // 值从 key_end_offset 开始
-            uint32_t value_start = key_end_offset;
-            
-            // 确定值的长度
-            // 如果 value_end_offset > key_end_offset，使用计算的长度
-            // 否则使用默认值 8 字节（u64）
-            uint32_t value_len;
-            if (value_end_offset > key_end_offset && value_end_offset < page_size_) {
-                value_len = value_end_offset - value_start;
-            } else {
-                value_len = 8; // 默认 u64 大小
-            }
-            
-            if (key_len > 0 && key_len < 256 && value_len > 0 && value_len <= 16) {
-                // 确保不超出页面范围
-                if (key_start + key_len <= page_size_ && value_start + value_len <= page_size_) {
-                    std::string key(reinterpret_cast<char*>(&buffer[key_start]), key_len);
+        // 如果 key_end > 400，说明是新格式，数据从 offset 416 开始
+        // 每个 entry = [key:8bytes][value:8bytes] = 16 bytes
+        if (first_key_end > 400) {
+            // 新格式: 固定 16 字节 per entry
+            size_t data_start = 416;  // 跳过 offset 表
+            for (uint16_t i = 0; i < entry_count && i < 200; i++) {
+                uint32_t key_offset = data_start + i * 16;
+                uint32_t value_offset = key_offset + 8;
+                
+                if (value_offset + 8 > page_size_) break;
+                
+                // 检查 key 是否是有效文本
+                bool is_text = true;
+                for (int j = 0; j < 8; j++) {
+                    uint8_t c = buffer[key_offset + j];
+                    if (c < 32 || c > 126) {
+                        is_text = false;
+                        break;
+                    }
+                }
+                
+                if (is_text) {
+                    std::string key(reinterpret_cast<const char*>(&buffer[key_offset]), 8);
                     
-                    // 解析值 (小端序 u64)
+                    // 解析 u64 值
                     uint64_t int_value = 0;
-                    for (uint32_t i = 0; i < value_len; i++) {
-                        int_value |= (static_cast<uint64_t>(buffer[value_start + i]) << (i * 8));
+                    for (int j = 0; j < 8; j++) {
+                        int_value |= (static_cast<uint64_t>(buffer[value_offset + j]) << (j * 8));
                     }
                     std::stringstream ss;
                     ss << int_value;
                     results.push_back({key, ss.str()});
                 }
             }
+        } else {
+            // 旧格式: 使用 offset 表
+            size_t data_start = 8;
             
-            // 处理额外条目（如果有）
-            for (uint16_t i = 1; i < entry_count; i++) {
-                uint32_t offset_base = 4 + i * 8;
-                if (offset_base + 8 > page_size_) break;
+            if (entry_count >= 1) {
+                uint32_t key_end_offset = buffer[4] | (buffer[5] << 8) | 
+                                          (buffer[6] << 16) | (buffer[7] << 24);
+                uint32_t value_end_offset = buffer[8] | (buffer[9] << 8) | 
+                                            (buffer[10] << 16) | (buffer[11] << 24);
                 
-                uint32_t ke = buffer[offset_base] | (buffer[offset_base + 1] << 8) |
-                              (buffer[offset_base + 2] << 16) | (buffer[offset_base + 3] << 24);
-                uint32_t ve = buffer[offset_base + 4] | (buffer[offset_base + 5] << 8) |
-                              (buffer[offset_base + 6] << 16) | (buffer[offset_base + 7] << 24);
+                // 第一个条目
+                uint32_t key_start = data_start;
+                uint32_t key_len = key_end_offset - key_start;
+                uint32_t value_start = key_end_offset;
+                uint32_t value_len = (value_end_offset > key_end_offset && value_end_offset < page_size_) ? 
+                                     (value_end_offset - value_start) : 8;
                 
-                uint32_t ks = data_start;
-                uint32_t kl = ke - ks;
-                uint32_t vs = ke;
-                uint32_t vl = (ve > ke && ve < page_size_) ? (ve - vs) : 8;
-                
-                if (kl > 0 && kl < 256 && vl > 0 && vl <= 16) {
-                    if (ks + kl <= page_size_ && vs + vl <= page_size_) {
-                        std::string key(reinterpret_cast<char*>(&buffer[ks]), kl);
+                if (key_len > 0 && key_len < 256 && value_len > 0 && value_len <= 16) {
+                    if (key_start + key_len <= page_size_ && value_start + value_len <= page_size_) {
+                        std::string key(reinterpret_cast<char*>(&buffer[key_start]), key_len);
                         uint64_t int_value = 0;
-                        for (uint32_t j = 0; j < vl; j++) {
-                            int_value |= (static_cast<uint64_t>(buffer[vs + j]) << (j * 8));
+                        for (uint32_t i = 0; i < value_len; i++) {
+                            int_value |= (static_cast<uint64_t>(buffer[value_start + i]) << (i * 8));
                         }
                         std::stringstream ss;
                         ss << int_value;
                         results.push_back({key, ss.str()});
+                    }
+                }
+                
+                // 处理额外条目
+                for (uint16_t i = 1; i < entry_count; i++) {
+                    uint32_t offset_base = 4 + i * 8;
+                    if (offset_base + 8 > page_size_) break;
+                    
+                    uint32_t ke = buffer[offset_base] | (buffer[offset_base + 1] << 8) |
+                                  (buffer[offset_base + 2] << 16) | (buffer[offset_base + 3] << 24);
+                    uint32_t ve = buffer[offset_base + 4] | (buffer[offset_base + 5] << 8) |
+                                  (buffer[offset_base + 6] << 16) | (buffer[offset_base + 7] << 24);
+                    
+                    uint32_t ks = data_start;
+                    uint32_t kl = ke - ks;
+                    uint32_t vs = ke;
+                    uint32_t vl = (ve > ke && ve < page_size_) ? (ve - vs) : 8;
+                    
+                    if (kl > 0 && kl < 256 && vl > 0 && vl <= 16) {
+                        if (ks + kl <= page_size_ && vs + vl <= page_size_) {
+                            std::string key(reinterpret_cast<char*>(&buffer[ks]), kl);
+                            uint64_t int_value = 0;
+                            for (uint32_t j = 0; j < vl; j++) {
+                                int_value |= (static_cast<uint64_t>(buffer[vs + j]) << (j * 8));
+                            }
+                            std::stringstream ss;
+                            ss << int_value;
+                            results.push_back({key, ss.str()});
+                        }
                     }
                 }
             }
@@ -664,13 +690,59 @@ void RedbParser::scan_all_leaf_pages(std::vector<std::pair<std::string, std::str
     file_.close();
     file_.open(filepath_, std::ios::binary);
     
-    // 测试读取以重置文件流状态
-    uint8_t test_buf[4096];
-    file_.read(reinterpret_cast<char*>(test_buf), 4096);
-    file_.seekg(0, std::ios::beg);  // 重置到开头
+    uint8_t buffer[4096];
     
-    // 从 root_page 开始扫描
-    traverse_tree(stats_.root_page, results);
+    // 扫描所有页面，寻找有效的叶子页
+    for (uint32_t page_num = 0; page_num < total_pages_; page_num++) {
+        file_.clear();
+        file_.seekg(static_cast<std::streamoff>(page_num) * page_size_, std::ios::beg);
+        file_.read(reinterpret_cast<char*>(buffer), page_size_);
+        
+        uint8_t type = buffer[0];
+        if (type != 1) continue;  // 不是叶子页
+        
+        uint16_t entry_count = buffer[2] | (buffer[3] << 8);
+        if (entry_count == 0) continue;
+        
+        // 检测格式
+        uint32_t first_key_end = buffer[4] | (buffer[5] << 8) | 
+                                  (buffer[6] << 16) | (buffer[7] << 24);
+        
+        // 新格式: 固定 16 字节 per entry
+        if (first_key_end > 400) {
+            size_t data_start = 416;
+            for (uint16_t i = 0; i < entry_count && i < 200; i++) {
+                uint32_t key_offset = data_start + i * 16;
+                uint32_t value_offset = key_offset + 8;
+                
+                if (value_offset + 8 > page_size_) break;
+                
+                // 检查 key 是否是有效文本
+                bool is_text = true;
+                for (int j = 0; j < 8; j++) {
+                    uint8_t c = buffer[key_offset + j];
+                    if (c < 32 || c > 126) {
+                        is_text = false;
+                        break;
+                    }
+                }
+                
+                if (is_text) {
+                    std::string key(reinterpret_cast<const char*>(&buffer[key_offset]), 8);
+                    
+                    // 解析 u64 值
+                    uint64_t int_value = 0;
+                    for (int j = 0; j < 8; j++) {
+                        int_value |= (static_cast<uint64_t>(buffer[value_offset + j]) << (j * 8));
+                    }
+                    std::stringstream ss;
+                    ss << int_value;
+                    results.push_back({key, ss.str()});
+                }
+            }
+        }
+        // 旧格式由 traverse_tree 处理
+    }
 }
 
 // 从叶子页数据中解析键值对
