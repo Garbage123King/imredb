@@ -1,316 +1,212 @@
-// main.cpp - redb Database Analyzer (ImGui UI)
-// Displays redb file content and structure
-
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include <GLFW/glfw3.h>
-#include "redb_analyzer.h"
-#include <cstdio>
-#include <cstring>
+#include <windows.h>
+#include <commdlg.h>
 #include <vector>
 #include <string>
+#include <fstream>
+#include <iomanip>
 
-// Window settings
-const char* glsl_version = "#version 130";
-const int WINDOW_WIDTH = 1280;
-const int WINDOW_HEIGHT = 720;
+const size_t PAGE_SIZE = 4096;
 
-// Global analyzer
-redb::RedbAnalyzer g_analyzer;
+struct ViewerState {
+    std::vector<uint8_t> fileData;
+    int selectedPage = -1;
+    std::string currentFileName = "None";
+};
 
-// File browser functions
-static void render_file_browser();
-static void render_toolbar();
-static void render_help();
+// --- 系统对话框与辅助函数 ---
+std::string OpenFileDialog() {
+    OPENFILENAMEA ofn;
+    char szFile[260] = { 0 };
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "Redb Files\0*.bin;*.db\0All Files\0*.*\0";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn) == TRUE) return std::string(ofn.lpstrFile);
+    return "";
+}
 
-// File browser state
-static bool show_file_browser = true;
-static char db_filepath[512] = "";
-static std::vector<std::string> recent_files;
-static const int MAX_RECENT_FILES = 10;
+void Property(const char* label, const char* fmt, ...) {
+    ImGui::TextDisabled("%s:", label);
+    ImGui::SameLine(140);
+    va_list args; va_start(args, fmt);
+    ImGui::TextV(fmt, args);
+    va_end(args);
+}
 
-int main(int argc, char** argv) {
-    // Initialize GLFW
-    if (!glfwInit()) {
-        fprintf(stderr, "Failed to initialize GLFW\n");
-        return 1;
-    }
-    
-    // Configure OpenGL
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    glfwWindowHint(GLFW_RESIZABLE, GL_TRUE);
-    
-    // Create window
-    GLFWwindow* window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, 
-                                         "redb Database Analyzer", NULL, NULL);
-    if (!window) {
-        fprintf(stderr, "Failed to create window\n");
-        glfwTerminate();
-        return 1;
-    }
-    
-    glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
-    
-    // Initialize ImGui
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    
-    // Set ImGui style
-    ImGui::StyleColorsDark();
-    
-    // Initialize platform/renderer bindings
-    ImGui_ImplGlfw_InitForOpenGL(window, true);
-    ImGui_ImplOpenGL3_Init(glsl_version);
-    
-    // Set ImGui font
-    io.Fonts->AddFontDefault();
-    
-    // Handle command line arguments
-    if (argc > 1) {
-        strncpy(db_filepath, argv[1], sizeof(db_filepath) - 1);
-        db_filepath[sizeof(db_filepath) - 1] = '\0';
-        show_file_browser = false;
-        
-        // Try to open file
-        if (!g_analyzer.open_file(db_filepath)) {
-            printf("Failed to open file: %s\n", db_filepath);
-            show_file_browser = true;
+// --- 渲染中间栏：元数据 ---
+void RenderMetadata(uint8_t* pagePtr, int pageIdx) {
+    ImGui::TextColored(ImVec4(1, 1, 0, 1), "PAGE %d DETAILS", pageIdx);
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (pageIdx == 0) {
+        Property("Magic", "%.9s", (char*)pagePtr);
+        Property("God Byte", "%02X", pagePtr[9]);
+        Property("Page Size", "%u", *(uint32_t*)(pagePtr + 12));
+        Property("Region Header Pgs", "%u", *(uint32_t*)(pagePtr + 16));
+        Property("Max Data Pages", "%u", *(uint32_t*)(pagePtr + 20));
+        Property("Full Regions", "%u", *(uint32_t*)(pagePtr + 24));
+    } else {
+        uint8_t type = pagePtr[0];
+        Property("Type", "%d", (int)type);
+        uint16_t count = *(uint16_t*)(pagePtr + 2);
+
+        if (type == 2) {
+            Property("Num Keys", "%d", count);
+            ImGui::Separator();
+            uint64_t* pnums = (uint64_t*)(pagePtr + 8 + (count + 1) * 16);
+            for(int i=0; i <= count; ++i) ImGui::Text("[%d] Child: %llu", i, (unsigned long long)pnums[i]);
+        } 
+        else if (type == 1) {
+            Property("Num Entries", "%d", count);
+            ImGui::Separator();
+            uint32_t* k_ends = (uint32_t*)(pagePtr + 4);
+            uint32_t* v_ends = (uint32_t*)(pagePtr + 4 + count * 4);
+            if (ImGui::BeginTable("Offsets", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("Idx"); ImGui::TableSetupColumn("K-End"); ImGui::TableSetupColumn("V-End");
+                ImGui::TableHeadersRow();
+                for (int i = 0; i < count; i++) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); ImGui::Text("%d", i);
+                    ImGui::TableSetColumnIndex(1); ImGui::Text("%u", k_ends[i]);
+                    ImGui::TableSetColumnIndex(2); ImGui::Text("%u", v_ends[i]);
+                }
+                ImGui::EndTable();
+            }
         }
     }
-    
-    // Main loop
+}
+
+// --- 渲染右栏：十六进制 ---
+void RenderHexView(const uint8_t* data, size_t size) {
+    ImGui::TextColored(ImVec4(1, 1, 0, 1), "RAW DATA VIEW");
+    ImGui::Separator();
+    ImGui::BeginChild("hex_scroll");
+    ImGuiListClipper clipper;
+    clipper.Begin((int)(size / 16)); 
+    while (clipper.Step()) {
+        for (int line = clipper.DisplayStart; line < clipper.DisplayEnd; line++) {
+            size_t offset = line * 16;
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%04X ", (unsigned int)offset);
+            ImGui::SameLine();
+            char hex_buf[64]; char* p = hex_buf;
+            for (int i = 0; i < 16; i++) {
+                uint8_t val = data[offset + i];
+                *p++ = "0123456789ABCDEF"[val >> 4];
+                *p++ = "0123456789ABCDEF"[val & 0xF];
+                *p++ = ' ';
+            }
+            *p = '\0';
+            ImGui::TextUnformatted(hex_buf); ImGui::SameLine();
+            char ascii_buf[18];
+            for (int i = 0; i < 16; i++) {
+                uint8_t c = data[offset + i];
+                ascii_buf[i] = (c >= 32 && c <= 126) ? (char)c : '.';
+            }
+            ascii_buf[16] = '\0';
+            ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.3f, 1.0f), "| %s", ascii_buf);
+        }
+    }
+    ImGui::EndChild();
+}
+
+int main() {
+    if (!glfwInit()) return 1;
+    GLFWwindow* window = glfwCreateWindow(1400, 800, "Redb Explorer", NULL, NULL);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 130");
+
+    ViewerState state;
+
     while (!glfwWindowShouldClose(window)) {
-        // Event handling
         glfwPollEvents();
-        
-        // Start ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
-        
-        // Set ImGui window
+
         ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(ImVec2(WINDOW_WIDTH, WINDOW_HEIGHT));
-        
-        // Render main UI
-        {
-            ImGui::Begin("redb Analyzer", NULL, 
-                        ImGuiWindowFlags_NoResize | 
-                        ImGuiWindowFlags_NoMove |
-                        ImGuiWindowFlags_NoTitleBar |
-                        ImGuiWindowFlags_MenuBar);
-            
-            // Menu bar
-            if (ImGui::BeginMenuBar()) {
-                if (ImGui::BeginMenu("File")) {
-                    if (ImGui::MenuItem("Open...", "Ctrl+O")) {
-                        show_file_browser = true;
-                    }
-                    if (ImGui::MenuItem("Close", "Ctrl+W")) {
-                        g_analyzer.close_file();
-                        db_filepath[0] = '\0';
-                        show_file_browser = true;
-                    }
-                    ImGui::Separator();
-                    if (ImGui::MenuItem("Exit", "Alt+F4")) {
-                        glfwSetWindowShouldClose(window, GLFW_TRUE);
-                    }
-                    ImGui::EndMenu();
+        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+        ImGui::Begin("Layout", nullptr, ImGuiWindowFlags_NoDecoration);
+
+        if (ImGui::Button("Open File...")) {
+            std::string path = OpenFileDialog();
+            if (!path.empty()) {
+                std::ifstream file(path, std::ios::binary | std::ios::ate);
+                if (file.is_open()) {
+                    std::streamsize size = file.tellg();
+                    file.seekg(0, std::ios::beg);
+                    state.fileData.assign(size, 0);
+                    file.read((char*)state.fileData.data(), size);
+                    state.currentFileName = path;
+                    state.selectedPage = -1;
                 }
-                
-                if (ImGui::BeginMenu("View")) {
-                    ImGui::MenuItem("Overview", NULL, 
-                                   g_analyzer.get_current_view() == redb::ViewMode::Overview);
-                    ImGui::MenuItem("Tree View", NULL,
-                                   g_analyzer.get_current_view() == redb::ViewMode::TreeView);
-                    ImGui::MenuItem("Page List", NULL,
-                                   g_analyzer.get_current_view() == redb::ViewMode::PageList);
-                    ImGui::MenuItem("Key-Value List", NULL,
-                                   g_analyzer.get_current_view() == redb::ViewMode::KeyValueList);
-                    ImGui::MenuItem("Raw Data", NULL,
-                                   g_analyzer.get_current_view() == redb::ViewMode::RawData);
-                    ImGui::EndMenu();
-                }
-                
-                if (ImGui::BeginMenu("Help")) {
-                    if (ImGui::MenuItem("Usage Guide")) {
-                        render_help();
-                    }
-                    ImGui::EndMenu();
-                }
-                
-                ImGui::EndMenuBar();
             }
-            
-            // Toolbar
-            render_toolbar();
-            
-            ImGui::Separator();
-            
-            // Main content area
-            if (show_file_browser || !g_analyzer.has_file()) {
-                render_file_browser();
-            } else {
-                g_analyzer.render();
-            }
-            
-            ImGui::End();
         }
-        
-        // Render
+        ImGui::SameLine(); ImGui::Text("File: %s", state.currentFileName.c_str());
+        ImGui::Separator();
+
+        ImGui::Columns(3, "three_panes", true);
+        static bool set_width = false;
+        if (!set_width) {
+            ImGui::SetColumnWidth(0, 240.0f); // 稍微加宽以显示 E: 或 K:
+            ImGui::SetColumnWidth(1, 350.0f);
+            set_width = true;
+        }
+
+        // 1. 左栏：增强版列表
+        ImGui::BeginChild("list_pane");
+        int totalPages = (int)(state.fileData.size() / PAGE_SIZE);
+        for (int i = 0; i < totalPages; i++) {
+            uint8_t* p = &state.fileData[i * PAGE_SIZE];
+            uint8_t type = p[0];
+            char label[128];
+
+            if (i == 0) {
+                sprintf(label, "P0 (Header)");
+            } else {
+                uint16_t count = *(uint16_t*)(p + 2);
+                if (type == 1) sprintf(label, "P%d (T:1, E:%u)", i, count);
+                else if (type == 2) sprintf(label, "P%d (T:2, K:%u)", i, count);
+                else sprintf(label, "P%d (T:%u)", i, (int)type);
+            }
+
+            if (ImGui::Selectable(label, state.selectedPage == i)) state.selectedPage = i;
+        }
+        ImGui::EndChild();
+        ImGui::NextColumn();
+
+        // 2. 中栏
+        ImGui::BeginChild("meta_pane");
+        if (state.selectedPage >= 0) RenderMetadata(&state.fileData[state.selectedPage * PAGE_SIZE], state.selectedPage);
+        ImGui::EndChild();
+        ImGui::NextColumn();
+
+        // 3. 右栏
+        ImGui::BeginChild("hex_pane");
+        if (state.selectedPage >= 0) RenderHexView(&state.fileData[state.selectedPage * PAGE_SIZE], PAGE_SIZE);
+        ImGui::EndChild();
+
+        ImGui::End();
         ImGui::Render();
-        int display_w, display_h;
-        glfwGetFramebufferSize(window, &display_w, &display_h);
-        glfwMakeContextCurrent(window);
-        glViewport(0, 0, display_w, display_h);
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        int dw, dh;
+        glfwGetFramebufferSize(window, &dw, &dh);
+        glViewport(0, 0, dw, dh);
+        glClearColor(0.12f, 0.12f, 0.12f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        
         glfwSwapBuffers(window);
     }
-    
-    // Cleanup
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
-    
-    glfwDestroyWindow(window);
-    glfwTerminate();
-    
+    ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext(); glfwTerminate();
     return 0;
-}
-
-// ===== Toolbar =====
-static void render_toolbar() {
-    if (ImGui::BeginChild("Toolbar", ImVec2(0, 40), false)) {
-        // File info
-        if (g_analyzer.has_file()) {
-            ImGui::Text("Open: %s", g_analyzer.get_filepath().c_str());
-            ImGui::SameLine(300);
-            
-            auto stats = g_analyzer.get_parser()->get_stats();
-            ImGui::Text("Version: v%d | Page Size: %u | Total Pages: %u", 
-                       static_cast<int>(stats.version),
-                       stats.page_size,
-                       stats.total_pages);
-            
-            ImGui::SameLine();
-            if (ImGui::SmallButton(" Close ")) {
-                g_analyzer.close_file();
-                show_file_browser = true;
-            }
-        } else {
-            ImGui::Text("redb Database Analyzer - No file open");
-        }
-    }
-    ImGui::EndChild();
-}
-
-// ===== File Browser =====
-static void render_file_browser() {
-    ImGui::SetNextWindowPos(ImVec2(WINDOW_WIDTH * 0.5f, WINDOW_HEIGHT * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    
-    ImGui::BeginChild("FileBrowser", ImVec2(500, 400), true);
-    
-    ImGui::Text("Open redb Database File");
-    ImGui::Separator();
-    
-    // File path input
-    ImGui::InputText("File Path", db_filepath, sizeof(db_filepath));
-    
-    // Quick path
-    ImGui::Text("Quick Path:");
-    ImGui::SameLine();
-    if (ImGui::SmallButton(" my_db.redb ")) {
-        strcpy(db_filepath, "my_redb_demo/my_db.redb");
-    }
-    
-    ImGui::Separator();
-    
-    // Recent files
-    if (!recent_files.empty()) {
-        if (ImGui::CollapsingHeader("Recent Files")) {
-            for (const auto& file : recent_files) {
-                if (ImGui::Selectable(file.c_str())) {
-                    strcpy(db_filepath, file.c_str());
-                }
-            }
-        }
-    }
-    
-    ImGui::Separator();
-    
-    // Open button
-    if (ImGui::Button(" Open File ", ImVec2(120, 30))) {
-        if (strlen(db_filepath) > 0) {
-            if (g_analyzer.open_file(db_filepath)) {
-                show_file_browser = false;
-                
-                // Add to recent files
-                bool found = false;
-                for (const auto& f : recent_files) {
-                    if (f == db_filepath) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    recent_files.insert(recent_files.begin(), db_filepath);
-                    if (recent_files.size() > MAX_RECENT_FILES) {
-                        recent_files.pop_back();
-                    }
-                }
-            } else {
-                ImGui::TextColored(ImVec4(1, 0, 0, 1), "Error: %s", 
-                                  g_analyzer.get_parser()->get_error());
-            }
-        }
-    }
-    
-    ImGui::SameLine();
-    
-    if (ImGui::Button(" Cancel ", ImVec2(80, 30))) {
-        show_file_browser = false;
-    }
-    
-    ImGui::EndChild();
-}
-
-// ===== Help =====
-static void render_help() {
-    ImGui::Begin("Usage Guide", NULL, ImGuiWindowFlags_AlwaysAutoResize);
-    
-    ImGui::Text("redb Database Analyzer");
-    ImGui::Separator();
-    
-    ImGui::Text("Features:");
-    ImGui::BulletText("Overview: Display database file info and statistics");
-    ImGui::BulletText("Tree View: Show B-tree structure");
-    ImGui::BulletText("Page List: List all pages with their types");
-    ImGui::BulletText("Key-Value List: Show all key-value pairs with search");
-    ImGui::BulletText("Raw Data: View page content in hex format");
-    
-    ImGui::Separator();
-    
-    ImGui::Text("Shortcuts:");
-    ImGui::BulletText("Ctrl+O: Open file");
-    ImGui::BulletText("Ctrl+W: Close file");
-    ImGui::BulletText("ESC: Exit");
-    
-    ImGui::Separator();
-    
-    ImGui::Text("redb File Format:");
-    ImGui::BulletText("Page size: 4KB (configurable via super header)");
-    ImGui::BulletText("Page types: Leaf (key-value data), Branch (index)");
-    ImGui::BulletText("Uses Copy-on-Write (COW) B-tree storage");
-    
-    if (ImGui::Button("Close")) {}
-    ImGui::End();
 }
